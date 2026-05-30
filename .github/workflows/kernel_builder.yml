@@ -1,0 +1,110 @@
+name: Weekly Kernel Builder
+
+on:
+  schedule:
+    - cron: '0 0 * * 1' # Every Monday at 00:00 UTC
+  workflow_dispatch: # Allow manual trigger
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    strategy:
+      matrix:
+        branch: [suki-su-latest, suki-su-latest-permissive]
+      fail-fast: false
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Maximize Build Space
+        run: |
+          chmod +x scripts/maximize_space.sh
+          ./scripts/maximize_space.sh
+
+      - name: Install Build Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y software-properties-common
+          sudo add-apt-repository -y ppa:deadsnakes/ppa
+          sudo apt-get update
+          sudo apt-get install -y build-essential rsync bc bison flex libssl-dev libelf-dev python2.7 python2.7-dev
+          
+          # Link python2.7 to python and python2
+          sudo ln -sf /usr/bin/python2.7 /usr/bin/python
+          sudo ln -sf /usr/bin/python2.7 /usr/bin/python2
+
+      - name: Setup Git
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Prepare Build Workspace
+        run: |
+          git worktree add build-workspace ${{ matrix.branch }}
+
+      - name: Update and Patch
+        id: updates
+        run: |
+          cd build-workspace
+          ../scripts/automate_updates.sh
+          
+          # Debug: show status before committing
+          git status
+          
+          # Stage all changes (including new files)
+          git add -A
+          
+          # Check for changes and commit
+          if ! git diff-index --quiet HEAD --; then
+            git commit -m "Auto-update KernelSU and SUSFS to latest commits"
+            git push origin ${{ matrix.branch }} || echo "Push failed, but continuing build"
+            echo "updated=true" >> $GITHUB_OUTPUT
+          else
+            echo "No changes detected. Dependencies are already up to date."
+            echo "updated=false" >> $GITHUB_OUTPUT
+          fi
+          
+          # Ensure a changelog exists for the release step
+          if [ -f changelog.md ]; then
+            cp changelog.md ../changelog_${{ matrix.branch }}.md
+          else
+            echo "No new updates this week." > ../changelog_${{ matrix.branch }}.md
+          fi
+
+      - name: Build Kernel
+        run: |
+          cd build-workspace
+          chmod +x build.sh
+          ./build.sh
+
+      - name: Upload Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: kernel-${{ matrix.branch }}
+          path: build-workspace/dist/*
+
+      - name: Create Release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG_NAME="build-$(date +'%Y.%m.%d')-${{ matrix.branch }}"
+          RELEASE_NAME="Weekly Build - $(date +'%Y-%m-%d') (${{ matrix.branch }})"
+          
+          # Use the generated changelog if it exists
+          if [ -f "changelog_${{ matrix.branch }}.md" ]; then
+            BODY_FILE="changelog_${{ matrix.branch }}.md"
+          else
+            echo "Weekly automated build for branch ${{ matrix.branch }}" > release_body.txt
+            BODY_FILE="release_body.txt"
+          fi
+          
+          gh release create "$TAG_NAME" \
+            --title "$RELEASE_NAME" \
+            --notes-file "$BODY_FILE" \
+            build-workspace/dist/*
